@@ -1,10 +1,9 @@
 <?php
-
 /*
 	Plugin Name: Related Posts for WordPress - WPML Compatibility
 	Plugin URI: http://www.relatedpostsforwp.com/wpml-compatibility/
 	Description: Add WPML support to Related Posts for WordPress Premium
-	Version: 1.0.2
+	Version: 1.0.3
 	Author: Barry Kooij
 	Author URI: http://www.barrykooij.com/
 	License: GPL v3
