@@ -1,11 +1,13 @@
 <?php
 /*
 	Plugin Name: Related Posts for WordPress - WPML Compatibility
-	Plugin URI: http://www.relatedpostsforwp.com/wpml-compatibility/
-	Description: Add WPML support to Related Posts for WordPress Premium
-	Version: 1.0.3
-	Author: Barry Kooij
-	Author URI: http://www.barrykooij.com/
+	Plugin URI: https://docs.relatedpostsforwp.com/multilingual/wpml-compatibility/
+	Description: Keeps related posts in the language of the post on WPML sites. Works with Related Posts for WordPress 3.0 or newer (free or Premium), and with Premium 2.x.
+	Version: 3.0.0
+	Author: Never5
+	Author URI: http://www.never5.com/
+	Requires at least: 6.8
+	Requires PHP: 7.4
 	License: GPL v3
 
 	This program is free software: you can redistribute it and/or modify
@@ -22,16 +24,83 @@
 	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+defined( 'ABSPATH' ) || exit;
 
 class RP4WP_WPML {
 
 	/**
-	 * Constructor
+	 * The legacy hooks Related Posts for WordPress 3.x registers its on-publish callbacks under, in the order they run.
+	 */
+	const PUBLISH_HOOKS = array( 'RP4WP_Hook_Related_Save_Words', 'RP4WP_Hook_Related_Auto_Link' );
+
+	/**
+	 * Posts published before WPML stored their language: post ID => the status before publishing.
+	 *
+	 * @var array<int, string>
+	 */
+	private $held = array();
+
+	/**
+	 * The on-publish callbacks that are taken off while a post is held.
+	 *
+	 * @var array<string, object>
+	 */
+	private $unhooked = array();
+
+	/**
+	 * Constructor. Runs after Related Posts for WordPress (plugins_loaded 20) and the safe mode check of Premium (30).
 	 */
 	public function __construct() {
-		if ( $this->check_dependencies() ) {
-			$this->setup();
+		add_action( 'plugins_loaded', array( $this, 'setup' ), 40 );
+	}
+
+	/**
+	 * Hook in, depending on the version of Related Posts for WordPress.
+	 */
+	public function setup() {
+		if ( ! defined( 'ICL_SITEPRESS_VERSION' ) ) {
+			add_action( 'admin_notices', array( $this, 'dep_notice_wpml' ) );
+
+			return;
 		}
+
+		if ( class_exists( '\LV2\WordPress\RelatedPostsForWP\Main' ) && \LV2\WordPress\RelatedPostsForWP\Main::get()->is_set_up() ) {
+			$this->setup_3();
+
+			return;
+		}
+
+		if ( class_exists( 'RP4WP_Constants' ) && defined( 'RP4WP_Constants::PREMIUM' ) && true === RP4WP_Constants::PREMIUM ) {
+			$this->setup_2();
+
+			return;
+		}
+
+		add_action( 'admin_notices', array( $this, 'dep_notice_rp4wp' ) );
+	}
+
+	/**
+	 * Related Posts for WordPress 3.x, free or Premium.
+	 */
+	private function setup_3() {
+		add_filter( 'rp4wp_finder_clauses', array( $this, 'filter_finder_clauses' ), 10, 3 );
+		add_filter( 'rp4wp_fill_conditions', array( $this, 'filter_fill_conditions' ), 10, 3 );
+
+		// The plugin reads and links a post when it is published, which is before WPML stores the language of a post that
+		// is created and published at once (the REST API, an import, WP-CLI). Such posts wait until WPML is done.
+		add_action( 'transition_post_status', array( $this, 'hold' ), 9, 3 );
+		add_action( 'transition_post_status', array( $this, 'rehook' ), 12, 0 );
+		add_action( 'wp_after_insert_post', array( $this, 'release' ), 99, 1 );
+		add_action( 'shutdown', array( $this, 'release_all' ), 0, 0 );
+	}
+
+	/**
+	 * Related Posts for WordPress Premium 2.x.
+	 */
+	private function setup_2() {
+		add_filter( 'rp4wp_get_related_posts_sql', array( $this, 'filter_related_posts_sql' ), 10, 4 );
+		add_filter( 'rp4wp_ignored_words_lang', array( $this, 'filter_ignored_words' ), 10, 4 );
+		add_action( 'wpml_translation_update', array( $this, 'force_relink_on_translation_insert' ), 10, 1 );
 	}
 
 	/**
@@ -39,9 +108,9 @@ class RP4WP_WPML {
 	 */
 	public function dep_notice_rp4wp() {
 		?>
-		<div id="message" class="error"><p><strong><a
+		<div class="notice notice-error"><p><strong><a
 						href="https://www.relatedpostsforwp.com/?utm_source=rp4wp-wpml&utm_medium=link&utm_campaign=notice"
-						target="_blank">Related Posts for WordPress Premium</a> 1.3.3 or higher</strong> must be
+						target="_blank">Related Posts for WordPress</a> 3.0 or higher</strong>, or Related Posts for WordPress Premium 2.x, must be
 				installed and activated to use <strong>Related Posts for WordPress - WPML Compatibility</strong>.</p>
 		</div><?php
 	}
@@ -51,52 +120,174 @@ class RP4WP_WPML {
 	 */
 	public function dep_notice_wpml() {
 		?>
-		<div id="message" class="error"><p><strong>WPML</strong> must be installed and activated to use <strong>Related
+		<div class="notice notice-error"><p><strong>WPML</strong> must be installed and activated to use <strong>Related
 					Posts for WordPress - WPML Compatibility</strong>.</p></div><?php
 	}
 
 	/**
-	 * Check plugin dependencies
+	 * The WPML language code of a post, or an empty string when WPML has none (yet).
 	 *
-	 * @return bool
+	 * @param int $post_id The post.
+	 *
+	 * @return string
 	 */
-	private function check_dependencies() {
+	private function language( $post_id ) {
+		$details = apply_filters( 'wpml_post_language_details', null, $post_id );
 
-		// Check RP4WP
-		if ( ! defined( 'RP4WP_PLUGIN_FILE' ) || ! defined( 'RP4WP_Constants::PREMIUM' ) || true !== RP4WP_Constants::PREMIUM ) {
-			add_action( 'admin_notices', array( $this, 'dep_notice_rp4wp' ) );
-
-			return false;
-		}
-
-		// Check WPML
-		if ( ! defined( 'ICL_SITEPRESS_VERSION' ) ) {
-			add_action( 'admin_notices', array( $this, 'dep_notice_wpml' ) );
-
-			return false;
-		}
-
-		return true;
+		return is_array( $details ) && ! empty( $details['language_code'] ) ? (string) $details['language_code'] : '';
 	}
 
 	/**
-	 * Setup method
+	 * The SQL condition that keeps a candidate related post in the language of the post, or an empty string when the
+	 * post has no language (yet). Posts of post types WPML does not translate have no language, and stay candidates.
+	 *
+	 * @param int    $post_id The post.
+	 * @param string $column  The column of the candidate's ID in the query.
+	 *
+	 * @return string
 	 */
-	private function setup() {
-		add_filter( 'rp4wp_get_related_posts_sql', array( $this, 'filter_related_posts_sql' ), 10, 4 );
-		add_filter( 'rp4wp_ignored_words_lang', array( $this, 'filter_ignored_words' ), 10, 4 );
-		add_action( 'wpml_translation_update', array( $this, 'force_relink_on_translation_insert' ), 10, 1 );
+	private function condition( $post_id, $column ) {
+		global $wpdb;
+
+		$language = $this->language( $post_id );
+		if ( '' === $language ) {
+			return '';
+		}
+
+		$table = $wpdb->prefix . 'icl_translations';
+		$posts = $wpdb->esc_like( 'post_' ) . '%';
+
+		return $wpdb->prepare(
+			"( EXISTS ( SELECT 1 FROM {$table} RP4WP_IT WHERE RP4WP_IT.element_id = {$column} AND RP4WP_IT.element_type LIKE %s AND RP4WP_IT.language_code = %s )
+			OR NOT EXISTS ( SELECT 1 FROM {$table} RP4WP_IT2 WHERE RP4WP_IT2.element_id = {$column} AND RP4WP_IT2.element_type LIKE %s ) )",
+			$posts,
+			$language,
+			$posts
+		);
 	}
 
 	/**
-	 * Add language to related posts fetch SQL so we only fetch posts of current post's language
+	 * Only find related posts in the language of the post (3.x).
 	 *
-	 * @param String $sql
-	 * @param int $post_id
-	 * @param String $post_type
-	 * @param int $limit
+	 * @param array  $clauses   The extra joins and conditions; the candidate related post is R.post_id.
+	 * @param int    $post_id   The post.
+	 * @param string $post_type The post type of the post.
 	 *
-	 * @return String
+	 * @return array
+	 */
+	public function filter_finder_clauses( $clauses, $post_id, $post_type ) {
+		$condition = $this->condition( $post_id, 'R.post_id' );
+		if ( '' !== $condition ) {
+			$clauses['where'][] = $condition;
+		}
+
+		return $clauses;
+	}
+
+	/**
+	 * Only fill up related posts with posts in the language of the post (Premium 3.0.1 and newer).
+	 *
+	 * @param string[] $conditions The conditions; {ID} is the post that may fill up.
+	 * @param int      $post_id    The post.
+	 * @param string   $post_type  The post type of the post.
+	 *
+	 * @return string[]
+	 */
+	public function filter_fill_conditions( $conditions, $post_id, $post_type ) {
+		$condition = $this->condition( $post_id, '{ID}' );
+		if ( '' !== $condition ) {
+			$conditions[] = $condition;
+		}
+
+		return $conditions;
+	}
+
+	/**
+	 * When a post is published before WPML stored its language, take the on-publish callbacks of the plugin off for it,
+	 * so it is read and linked once its language is known (3.x).
+	 *
+	 * @param string   $new_status The new status.
+	 * @param string   $old_status The old status.
+	 * @param \WP_Post $post       The post.
+	 */
+	public function hold( $new_status, $old_status, $post ) {
+		if ( 'publish' !== $new_status || 'publish' === $old_status || ! $post instanceof \WP_Post || '' !== $this->language( (int) $post->ID ) ) {
+			return;
+		}
+
+		if ( ! class_exists( '\LV2\WordPress\RelatedPostsForWP\Compat\LegacyHooks' ) ) {
+			return;
+		}
+
+		foreach ( self::PUBLISH_HOOKS as $name ) {
+			$hook = \LV2\WordPress\RelatedPostsForWP\Compat\LegacyHooks::get( $name );
+			if ( $hook && remove_action( $hook->get_tag(), array( $hook, 'run' ), $hook->get_priority() ) ) {
+				$this->unhooked[ $name ] = $hook;
+			}
+		}
+
+		if ( count( $this->unhooked ) > 0 ) {
+			$this->held[ (int) $post->ID ] = (string) $old_status;
+		}
+	}
+
+	/**
+	 * Put the on-publish callbacks back, so other posts are handled as usual (3.x).
+	 */
+	public function rehook() {
+		foreach ( $this->unhooked as $hook ) {
+			add_action( $hook->get_tag(), array( $hook, 'run' ), $hook->get_priority(), $hook->get_args() );
+		}
+
+		$this->unhooked = array();
+	}
+
+	/**
+	 * Read and link a held post, now that WPML stored its language (3.x).
+	 *
+	 * @param int $post_id The post.
+	 */
+	public function release( $post_id ) {
+		$post_id = (int) $post_id;
+		if ( ! isset( $this->held[ $post_id ] ) ) {
+			return;
+		}
+
+		$old_status = $this->held[ $post_id ];
+		unset( $this->held[ $post_id ] );
+
+		$post = get_post( $post_id );
+		if ( ! $post instanceof \WP_Post || 'publish' !== $post->post_status ) {
+			return;
+		}
+
+		foreach ( self::PUBLISH_HOOKS as $name ) {
+			$hook = \LV2\WordPress\RelatedPostsForWP\Compat\LegacyHooks::get( $name );
+			if ( $hook ) {
+				$hook->run( 'publish', $old_status, $post );
+			}
+		}
+	}
+
+	/**
+	 * Read and link the posts that are still held at the end of the request, for code that publishes a post without
+	 * wp_insert_post() (3.x).
+	 */
+	public function release_all() {
+		foreach ( array_keys( $this->held ) as $post_id ) {
+			$this->release( $post_id );
+		}
+	}
+
+	/**
+	 * Filter related posts SQL query (2.x)
+	 *
+	 * @param $sql
+	 * @param $post_id
+	 * @param $post_type
+	 * @param $limit
+	 *
+	 * @return string
 	 */
 	public function filter_related_posts_sql( $sql, $post_id, $post_type, $limit ) {
 		global $wpdb, $sitepress;
@@ -122,12 +313,12 @@ class RP4WP_WPML {
 	}
 
 	/**
-	 * Load the ignored words of the post's language
+	 * Filter ignored words language (2.x)
 	 *
-	 * @param String $lang
-	 * @param int $post_id
+	 * @param $lang
+	 * @param $post_id
 	 *
-	 * @return String
+	 * @return string
 	 */
 	public function filter_ignored_words( $lang, $post_id ) {
 
@@ -143,10 +334,9 @@ class RP4WP_WPML {
 	}
 
 	/**
-	 * We force an automatic relink when the translation is inserted by WPML.
-	 * This is needed because WPML does not have the translation ready when the post is published (which is when we look for related posts).
+	 * Force a relink when a translation is inserted (2.x)
 	 *
-	 * @param array $args
+	 * @param $args
 	 */
 	public function force_relink_on_translation_insert( $args ) {
 		// only run on _insert_ of new translation
@@ -193,8 +383,4 @@ class RP4WP_WPML {
 	}
 }
 
-function __rp4wp_wpml_main() {
-	new RP4WP_WPML();
-}
-
-add_action( 'plugins_loaded', '__rp4wp_wpml_main', 20 );
+new RP4WP_WPML();
